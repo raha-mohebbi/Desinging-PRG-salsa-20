@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<title>PRG - Salsa20 Inspired</title>
+
+<!-- کتابخانه Chart.js برای رسم نمودار -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+  /* ---------------- استایل کلی ---------------- */
+  body{
+    font-family: monospace; 
+    background: linear-gradient(135deg, #020617, #0f172a); 
+    color:#e5e7eb; 
+    padding:28px;
+    min-height:100vh; 
+  }
+
+  h1{
+    font-size:22px;
+    margin-bottom:12px;
+    font-weight:700;
+  }
+
+  .box{
+    background:#020617;
+    border:1px solid #1f2937;
+    border-radius:16px;
+    padding:18px;
+    margin-bottom:18px;
+    box-shadow: 0 10px 25px rgba(0,0,0,.25);
+    transition: transform .2s ease, box-shadow .2s ease;
+  }
+
+  .box:hover{
+    transform: translateY(-2px);
+    box-shadow: 0 14px 35px rgba(0,0,0,.35);
+  }
+
+  button{
+    cursor:pointer;
+    margin-top:16px;
+    padding:10px 14px;
+    border-radius:12px;
+    border:1px solid #4f46e5;
+    background:#6366f1;
+    color:white;
+    font-weight:600;
+    transition: background .2s ease, box-shadow .2s ease;
+  }
+
+  button:hover{
+    background:#4f46e5;
+    box-shadow:0 10px 25px rgba(99,102,241,.4);
+  }
+
+  pre{
+    white-space:pre-wrap;
+    word-break:break-all;
+    font-size:12px;
+    line-height:1.6;
+  }
+</style>
+</head>
+
+<body>
+
+<h1>PRG(Salsa20-like) </h1>
+
+<div class="box">
+      <div >
+  <button onclick="runPRG()">Generate</button>
+</div>
+  <h3>Results</h3>
+  <pre id="output"></pre>
+  <canvas id="advChart" height="140" style="margin-top:16px"></canvas>
+
+</div>
+
+<script>
+/* ---------------- functions ---------------- */
+
+// create random 128-bit key
+function randomKey128() {
+  const a = new Uint8Array(16); 
+  crypto.getRandomValues(a);   
+  return a;
+}
+
+
+const seenR = new Set(); 
+function randomNonce64() {
+  let v;
+  do {
+    const x = new Uint8Array(8);
+    crypto.getRandomValues(x);
+    v = Array.from(x).map(b=>b.toString(16).padStart(2,'0')).join('');
+  } while (seenR.has(v));
+  seenR.add(v);
+  return hexToBytes(v);
+}
+
+// hex to byte
+function hexToBytes(hex){
+  const arr = new Uint8Array(hex.length/2);
+  for(let i=0;i<hex.length;i+=2)
+    arr[i/2]=parseInt(hex.substr(i,2),16);
+  return arr;
+}
+
+// byte to hex
+function bytesToHex(bytes){
+  return Array.from(bytes)
+              .map(b=>b.toString(16).padStart(2,'0'))
+              .join('');
+}
+
+// concatenate
+function concat(...arrays){
+  const total = arrays.reduce((s,a)=>s+a.length,0);
+  const out = new Uint8Array(total);
+  let o=0;
+  for(const a of arrays){ out.set(a,o); o+=a.length; }
+  return out;
+}
+
+
+async function sha256(bytes){
+  const d = await crypto.subtle.digest("SHA-256", bytes);
+  return new Uint8Array(d);
+}
+
+/* ---------------- PRG ---------------- */
+async function PRG(K, r, i) {
+  const sigma = new TextEncoder().encode("expand 32-byte k").slice(0,8); 
+
+  const state32 = concat(sigma, K.slice(0,16), r.slice(0,8)); // first 32 bytes
+  const state64 = concat(state32, state32);                   // 64 bytes
+
+  let hashes = [];
+  let cur = state64;
+
+  
+  for(let c=0;c<i;c++){
+    cur = await sha256(cur);
+    hashes.push(cur);
+  }
+
+  const H = concat(...hashes);
+
+  const viewH = new DataView(H.buffer);
+  const viewS = new DataView(state64.buffer);
+  const out   = new Uint8Array(H.length);
+  const viewO = new DataView(out.buffer);
+
+  // sum modulo 2^32
+  for(let w=0; w<Math.min(H.length, state64.length); w+=4){
+    const a = viewH.getUint32(w,true);
+    const b = viewS.getUint32(w,true);
+    viewO.setUint32(w,(a+b)>>>0,true);
+  }
+
+ 
+  for(let j=state64.length;j<H.length;j++) out[j]=H[j];
+
+  return {state64, H, key: out};
+}
+
+/* ---------------- attackers---------------- */
+
+// count number of 1 bits in byte array
+function countOnes(bytes){
+  let c=0;
+  for(const b of bytes) c += b.toString(2).split('0').join('').length;
+  return c;
+}
+
+
+function A1(x){ 
+  const p = countOnes(x)/(8*x.length);
+  return (p>0.55 || p<0.45) ? 1 : 0;
+}
+
+
+function A2(x){ 
+  const h = bytesToHex(x);
+  return h.match(/([0-9a-f]{4})\1{1,2}/) ? 1 : 0;
+}
+
+
+function A3(x){
+  let ones = 0;
+  for(const b of x) ones += b & 1;
+  return (ones / x.length > 0.55 || ones / x.length < 0.45) ? 1 : 0;
+}
+
+
+function A4(x){
+  let c=0;
+  for(let i=1;i<x.length;i++) if((x[i]^x[i-1])===0) c++;
+  return (c/x.length > 0.6) ? 1 : 0;
+}
+
+
+function A5(x){
+  let low=0;
+  for(const b of x) if(b<8) low++;
+  return (low>x.length*0.08) ? 1 : 0;
+}
+
+
+function A6(x){
+  const s = new Set();
+  for(let i=0;i<x.length;i+=2) s.add(x[i]<<8 | x[i+1]||0);
+  return (s.size < x.length/2) ? 1 : 0;
+}
+
+
+function A7(x){
+  let run=1,max=1;
+  for(let i=1;i<x.length;i++){
+    if(x[i]===x[i-1]){ run++; max=Math.max(max,run); }
+    else run=1;
+  }
+  return (max>4) ? 1 : 0;
+}
+
+
+
+/* ---------------- charts  ---------------- */
+let advChart = null;
+function drawChart(values){
+  const ctx = document.getElementById("advChart");
+  const data = {
+    labels: ["A1","A2","A3","A4","A5","A6","A7"],
+    datasets: [{ label: "Adversary Output (1 = شک کرد)", data: values, borderWidth: 2 }]
+  };
+  const options = { scales: { y: { beginAtZero:true, max:1 } } };
+  if (advChart){ advChart.data.datasets[0].data = values; advChart.update(); }
+  else { advChart = new Chart(ctx, { type: "bar", data, options }); }
+}
+
+/* ----------------  PRG ---------------- */
+async function runPRG(){
+  const i = 10; 
+
+  const K = randomKey128(); 
+  const r = randomNonce64(); 
+
+  const {state64, H, key} = await PRG(K,r,i);
+
+  const advs = [A1,A2,A3,A4,A5,A6,A7].map(fn=>fn(key));
+
+  document.getElementById('output').textContent =
+`
+K (128-bit): ${bytesToHex(K)}
+r (64-bit):  ${bytesToHex(r)}
+i:           ${i}
+
+State(64B):  ${bytesToHex(state64)}
+H (concat):  ${bytesToHex(H)}
+KEY:         ${bytesToHex(key)}
+
+Adversaries A1..A7 outputs: ${advs.join('  ')}   (۱ = " doubted")
+`;
+
+  drawChart(advs);
+}
+</script>
+
+</body>
+</html>
